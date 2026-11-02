@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101827">
+<title>ICT Liquidity Sweep Scanner</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#121d2e;--line:#26364d;--muted:#91a4bd;--text:#eef4fb;--green:#25c58a;--red:#ff6474;--blue:#6ca8ff;--yellow:#f4c96b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{padding:22px 16px 16px;background:#101a2a;border-bottom:1px solid var(--line)}
+h1{font-size:21px;margin:0 0 7px} .sub{font-size:12px;color:var(--muted)}
+main{max-width:900px;margin:auto;padding:14px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.stat,.panel,.signal{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:12px}
+.stat b{display:block;font-size:20px;margin-top:5px}.stat span,.muted{font-size:11px;color:var(--muted)}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+button{border:0;border-radius:10px;padding:11px 14px;background:#2865b5;color:white;font-weight:700}
+button.secondary{background:#26364d;color:var(--text)}
+.status{font-size:12px;color:var(--muted);padding:8px 2px}
+.signal{margin:9px 0;padding:13px}.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.symbol{font-size:17px;font-weight:800}.tag{font-size:11px;font-weight:800;border-radius:7px;padding:5px 8px}
+.long{background:#123d34;color:#57e0ae}.short{background:#4a202c;color:#ff8793}
+.details{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}
+.detail{background:#0d1726;border-radius:8px;padding:8px}.detail span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.detail b{font-size:12px;word-break:break-all}
+.reason{font-size:12px;color:#c1cee0;margin-top:10px;line-height:1.5}
+.empty{text-align:center;padding:32px 12px;color:var(--muted);font-size:13px}
+footer{font-size:11px;color:var(--muted);line-height:1.6;padding:16px 3px 30px}
+a{color:var(--blue)}
+@media(min-width:650px){.signal-list{display:grid;grid-template-columns:1fr 1fr;gap:10px}.signal{margin:0}.details{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>ICT Liquidity Sweep Scanner</h1>
+  <div class="sub">BINANCE USDⓈ-M · USDT 무기한 선물 · 15분봉</div>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat"><span>검색 종목</span><b id="count">0 / 45</b></div>
+    <div class="stat"><span>매수 신호</span><b id="longCount" style="color:var(--green)">0</b></div>
+    <div class="stat"><span>매도 신호</span><b id="shortCount" style="color:var(--red)">0</b></div>
+  </div>
+  <div class="panel">
+    <div class="top"><b>스캐너 상태</b><span id="clock" class="muted">대기 중</span></div>
+    <div id="status" class="status">시작 버튼을 눌러 스캔하세요.</div>
+    <div class="controls">
+      <button id="start">스캔 시작</button>
+      <button id="stop" class="secondary">중지</button>
+      <button id="refresh" class="secondary">지금 새로고침</button>
+    </div>
+    <div class="muted">거래량 상위 45개 종목 · 60초 자동 갱신</div>
+  </div>
+  <h3 style="font-size:16px;margin:20px 2px 10px">진입 신호</h3>
+  <div id="signals" class="signal-list"><div class="empty">아직 검색된 신호가 없습니다.</div></div>
+  <footer>
+    <b>전략 조건</b><br>
+    ① 최근 20개 확정 캔들의 고점/저점 유동성 스윕<br>
+    ② 스윕 후 강한 반대 방향 변동(ATR 기반)과 구조 돌파(BOS)<br>
+    ③ FVG 또는 마지막 반대 캔들 기반 오더블록 형성<br>
+    ④ 이후 확정 캔들이 해당 영역을 되돌림 테스트하면 신호 표시<br><br>
+    신호는 교육·분석용 참고 정보이며 자동 주문을 실행하지 않습니다. 실전 투입 전 충분한 백테스트가 필요합니다.
+  </footer>
+</main>
+<script>
+const BASE='https://fapi.binance.com';
+const INTERVAL='15m', TOP_N=45, REFRESH_MS=60000;
+let timer=null, busy=false, stopped=true;
+const $=id=>document.getElementById(id);
+const fmt=n=>Number.isFinite(n)?Number(n).toPrecision(7):'—';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function getJSON(url){
+  const r=await fetch(url,{cache:'no-store'});
+  if(!r.ok) throw new Error('Binance API 응답 오류: '+r.status);
+  return r.json();
+}
+function avg(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:0}
+function analyze(kl){
+  // Binance kline: [openTime, open, high, low, close, volume, closeTime, ...]
+  const c=kl.map(k=>({t:+k[0],o:+k[1],h:+k[2],l:+k[3],cl:+k[4],ct:+k[6]}));
+  if(c.length<45)return null;
+  // 마지막 캔들은 진행 중일 수 있으므로 제외
+  const x=c.slice(0,-1), last=x.length-1;
+  const ranges=x.slice(-20).map(k=>k.h-k.l);
+  const atr=avg(ranges);
+  if(!atr)return null;
+  const look=20, start=Math.max(look+3,last-18);
+  let best=null;
+  for(let s=start;s<=last-3;s++){
+    const prev=x.slice(s-look,s);
+    const priorHigh=Math.max(...prev.map(k=>k.h));
+    const priorLow=Math.min(...prev.map(k=>k.l));
+    const sweep=x[s];
+    const bullSweep=sweep.l<priorLow && sweep.cl>priorLow;
+    const bearSweep=sweep.h>priorHigh && sweep.cl<priorHigh;
+    if(!bullSweep&&!bearSweep)continue;
+    const dir=bullSweep?'LONG':'SHORT';
+    const sweepExtreme=bullSweep?sweep.l:sweep.h;
+    // 1~3 candles after sweep: displacement + BOS
+    for(let d=s+1;d<=Math.min(s+3,last-2);d++){
+      const disp=x[d], body=Math.abs(disp.cl-disp.o);
+      const strong=body>=atr*0.75;
+      const bos=bullSweep?disp.cl>priorHigh:disp.cl<priorLow;
+      const candleDir=bullSweep?disp.cl>disp.o:disp.cl<disp.o;
+      if(!strong||!bos||!candleDir)continue;
+      // 3-candle FVG, or last opposing candle as OB fallback
+      let zone=null, zoneType='';
+      if(bullSweep && x[d].l>x[d-2].h){zone={lo:x[d-2].h,hi:x[d].l};zoneType='FVG';}
+      if(bearSweep && x[d].h<x[d-2].l){zone={lo:x[d].h,hi:x[d-2].l};zoneType='FVG';}
+      if(!zone){
+        let ob=null;
+        for(let j=d-1;j>=Math.max(s,d-5);j--){
+          if(bullSweep?x[j].cl<x[j].o:x[j].cl>x[j].o){ob=x[j];break;}
+        }
+        if(!ob)continue;
+        zone={lo:ob.l,hi:ob.h};zoneType='OB';
+      }
+      // Wait for a later closed candle to revisit the zone and close in trade direction
+      let retest=-1;
+      for(let j=d+1;j<=last;j++){
+        const k=x[j], touched=k.l<=zone.h&&k.h>=zone.lo;
+        const confirmed=bullSweep?k.cl>k.o&&k.cl>=zone.lo:k.cl<k.o&&k.cl<=zone.h;
+        if(touched&&confirmed){retest=j;break;}
+      }
+      if(retest<0)continue;
+      const entry=(zone.lo+zone.hi)/2;
+      const sl=bullSweep?sweepExtreme-atr*0.12:sweepExtreme+atr*0.12;
+      const risk=Math.abs(entry-sl);
+      if(!risk||!Number.isFinite(risk))continue;
+      const tp=bullSweep?entry+2*risk:entry-2*risk;
+      best={dir,entry,sl,tp,zone,zoneType,sweepTime:sweep.t,retestTime:x[retest].t,signalTime:x[last].t};
+    }
+  }
+  return best;
+}
+function render(items){
+  const longs=items.filter(x=>x.sig.dir==='LONG'), shorts=items.filter(x=>x.sig.dir==='SHORT');
+  $('longCount').textContent=longs.length;$('shortCount').textContent=shorts.length;
+  $('count').textContent=TOP_N+' / '+TOP_N;
+  if(!items.length){$('signals').innerHTML='<div class="empty">현재 조건을 모두 충족한 진입 신호가 없습니다.<br>다음 스캔에서 다시 확인합니다.</div>';return;}
+  $('signals').innerHTML=items.map(({symbol,sig,price})=>{
+    const isL=sig.dir==='LONG';
+    return `<article class="signal">
+      <div class="top"><span class="symbol">${symbol.replace('USDT','/USDT')}</span><span class="tag ${isL?'long':'short'}">${isL?'매수 LONG':'매도 SHORT'}</span></div>
+      <div class="reason">${sig.zoneType} 되돌림 확인 · 유동성 스윕 + BOS 확정</div>
+      <div class="details">
+        <div class="detail"><span>진입 기준</span><b>${fmt(sig.entry)}</b></div>
+        <div class="detail"><span>손절 SL</span><b>${fmt(sig.sl)}</b></div>
+        <div class="detail"><span>익절 TP (1:2)</span><b>${fmt(sig.tp)}</b></div>
+      </div>
+      <div class="reason">현재가: ${fmt(price)} · 영역: ${fmt(sig.zone.lo)} ~ ${fmt(sig.zone.hi)}</div>
+    </article>`;
+  }).join('');
+}
+async function scan(){
+  if(busy)return;
+  busy=true;stopped=false;
+  $('status').textContent='바이낸스 종목 및 15분봉 데이터 조회 중…';
+  try{
+    const tickers=await getJSON(BASE+'/fapi/v1/ticker/24hr');
+    const symbols=tickers.filter(t=>t.symbol.endsWith('USDT')&&!t.symbol.includes('_')).sort((a,b)=>+b.quoteVolume-+a.quoteVolume).slice(0,TOP_N);
+    const results=[];
+    let done=0;
+    const workers=Array.from({length:5},async()=>{
+      while(done<symbols.length&&!stopped){
+        const idx=done++,t=symbols[idx];
+        try{
+          const kl=await getJSON(BASE+`/fapi/v1/klines?symbol=${t.symbol}&interval=${INTERVAL}&limit=100`);
+          const sig=analyze(kl);
+          if(sig)results.push({symbol:t.symbol,sig,price:+t.lastPrice});
+        }catch(e){console.warn(t.symbol,e.message);}
+        $('status').textContent=`데이터 분석 중… ${Math.min(done,symbols.length)}/${symbols.length}`;
+      }
+    });
+    await Promise.all(workers);
+    if(stopped)return;
+    results.sort((a,b)=>b.sig.signalTime-a.sig.signalTime);
+    render(results);
+    $('status').textContent=`스캔 완료 · ${symbols.length}개 종목 확인 · 신호 ${results.length}개`;
+    $('clock').textContent='마지막 확인 '+new Date().toLocaleTimeString('ko-KR');
+  }catch(e){$('status').textContent='오류: '+e.message+' · 잠시 후 다시 시도하세요.';}
+  finally{busy=false;}
+}
+function start(){if(timer)clearInterval(timer);stopped=false;scan();timer=setInterval(()=>{if(!stopped)scan();},REFRESH_MS);}
+function stop(){stopped=true;if(timer)clearInterval(timer);timer=null;$('status').textContent='자동 스캔이 중지되었습니다.';}
+$('start').addEventListener('click',start);
+$('stop').addEventListener('click',stop);
+$('refresh').addEventListener('click',()=>{stopped=false;scan();});
+</script>
+</body>
+</html>
